@@ -1,0 +1,138 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Helper: check if the user is a participant in the game
+    function isGameParticipant(gameId) {
+      return exists(/databases/$(database)/documents/games/$(gameId)/players/$(request.auth.uid));
+    }
+
+    match /games/{gameId} {
+      // Any authenticated user can read a specific game by ID (needed for join-by-code flow)
+      allow get: if isSignedIn();
+
+      // Authenticated users can list games they host (hostId filter)
+      // or games they participate in
+      allow list: if isSignedIn()
+        && resource.data.hostId == request.auth.uid;
+
+      allow create: if isSignedIn()
+        && request.resource.data.hostId == request.auth.uid
+        && request.resource.data.status == 'waiting'
+        && request.resource.data.maxPlayers is number
+        && request.resource.data.maxPlayers >= 2
+        && request.resource.data.durationMinutes is number
+        && request.resource.data.durationMinutes >= 3
+        && request.resource.data.difficulty in ['easy', 'medium', 'hard']
+        && request.resource.data.spyCount is number
+        && request.resource.data.spyCount >= 1
+        && request.resource.data.detectiveCount is number
+        && request.resource.data.detectiveCount >= 1
+        && request.resource.data.preGameQuestions is list
+        && request.resource.data.preGameQuestions.size() > 0
+        && request.resource.data.currentPlayerCount == 0;
+
+      allow update: if isSignedIn()
+        && (
+          // Host can update status and game-state fields via Cloud Functions bypass rules,
+          // but this rule covers direct host updates (e.g. status transitions)
+          (resource.data.hostId == request.auth.uid
+            && request.resource.data.hostId == resource.data.hostId
+            && request.resource.data.maxPlayers == resource.data.maxPlayers
+            && request.resource.data.durationMinutes == resource.data.durationMinutes
+            && request.resource.data.difficulty == resource.data.difficulty
+            && request.resource.data.spyCount == resource.data.spyCount
+            && request.resource.data.detectiveCount == resource.data.detectiveCount
+            && request.resource.data.preGameQuestions == resource.data.preGameQuestions)
+          ||
+          // Any authenticated user can increment currentPlayerCount by 1 when joining (waiting state only)
+          (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['currentPlayerCount'])
+            && request.resource.data.currentPlayerCount == (('currentPlayerCount' in resource.data ? resource.data.currentPlayerCount : 0) + 1)
+            && resource.data.status == 'waiting')
+        );
+
+      // Host can delete their own game
+      allow delete: if isSignedIn()
+        && resource.data.hostId == request.auth.uid;
+    }
+
+    // Role secrets — only the individual player can read their own role.
+    // Host can read ALL secrets (needed for the dashboard spy tracker).
+    // Writes are restricted to Cloud Functions (Admin SDK bypasses rules)
+    match /games/{gameId}/secrets/{playerId} {
+      allow read: if isSignedIn()
+        && (request.auth.uid == playerId
+            || get(/databases/$(database)/documents/games/$(gameId)).data.hostId == request.auth.uid);
+      allow write: if false;
+    }
+
+    match /games/{gameId}/players/{playerId} {
+      // Only game participants and the host can read player data
+      allow read: if isSignedIn()
+        && (request.auth.uid == playerId
+            || isGameParticipant(gameId)
+            || get(/databases/$(database)/documents/games/$(gameId)).data.hostId == request.auth.uid);
+
+      allow create: if isSignedIn()
+        && request.auth.uid == playerId
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.score == 0
+        && request.resource.data.status in ['active', 'pending']
+        && ('role' in request.resource.data ? (request.resource.data.role is string || request.resource.data.role == null) : true)
+        && request.resource.data.name is string;
+
+      // Players can update their own status (e.g., from pending to active when submitting answers)
+      // They can also save answers when submitting. Score and role are server-only.
+      // Host can also update player status (suspend/unsuspend)
+      allow update: if isSignedIn()
+        && (
+          // Player self-update (original rule)
+          (request.auth.uid == playerId
+           && request.resource.data.userId == request.auth.uid
+           && request.resource.data.score == resource.data.score
+           && request.resource.data.role == resource.data.role
+           && (request.resource.data.status == resource.data.status
+               || (resource.data.status == 'pending' && request.resource.data.status == 'active')))
+          ||
+          // Host can update player status (suspend/unsuspend)
+          (get(/databases/$(database)/documents/games/$(gameId)).data.hostId == request.auth.uid)
+        );
+
+      // The host can remove players (kick them)
+      allow delete: if isSignedIn()
+        && get(/databases/$(database)/documents/games/$(gameId)).data.hostId == request.auth.uid;
+    }
+
+    match /users/{userId} {
+      allow read, write: if isSignedIn() && request.auth.uid == userId;
+
+      match /tasks/{taskId} {
+        allow read: if isSignedIn() && request.auth.uid == userId;
+        allow create, update, delete: if isSignedIn() && request.auth.uid == userId;
+      }
+
+      match /connections/{connectionId} {
+        allow read: if isSignedIn() && request.auth.uid == userId;
+        allow create, update, delete: if isSignedIn() && request.auth.uid == userId;
+      }
+    }
+
+    // CollectionGroup query: users can read their own player docs across all games
+    // This enables the "Rooms Joined" feature on the profile page
+    match /{path=**}/players/{playerId} {
+      allow read: if isSignedIn()
+        && resource.data.userId == request.auth.uid;
+    }
+
+    // Root tasks collection
+    match /tasks/{taskId} {
+      allow read: if isSignedIn() 
+        && (resource.data.userId == request.auth.uid 
+            || get(/databases/$(database)/documents/games/$(resource.data.gameId)).data.hostId == request.auth.uid);
+      allow write: if false; // Tasks are updated exclusively by Cloud Functions
+    }
+  }
+}
